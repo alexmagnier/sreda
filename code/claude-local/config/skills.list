@@ -1,0 +1,5 @@
+# Skills available in «Локальный Claude» (no internet). One per line: <name> or <name> <absolute source dir>.
+# Default source: ~/.claude/skills/<name>. Symlinked, so edits to the originals apply here.
+# The installing agent fills this with the user's own skills (01_ПЛАН-УСТАНОВКИ.md, phase 4).
+# Leave out skills that need cloud MCP servers (Gmail, Drive, Supabase, image/video generators…):
+# they cannot work offline and only add tokens to every request.

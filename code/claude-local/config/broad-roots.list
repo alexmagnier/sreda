@@ -1,0 +1,6 @@
+# Folders that contain MANY projects at once (and client folders among them).
+# claude-local refuses to open such a folder as a whole: the session could then write anywhere inside it.
+# One path per line, ~ allowed. The installing agent adds the user's own projects root(s).
+~/Documents
+~/Desktop
+~/Downloads

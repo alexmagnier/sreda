@@ -1,0 +1,14 @@
+#!/bin/zsh
+# Fake LM Studio CLI for tests. State: $FAKE_LMS_STATE/loaded (JSON list like `lms ps --json`), log: $FAKE_LMS_STATE/log
+S=${FAKE_LMS_STATE:?}; L=$S/log
+print -r -- "$(date +%T) lms $*" >> $L
+case "$1" in
+  ps)     [[ -f $S/loaded ]] && cat $S/loaded || print '[]' ;;
+  unload) rm -f $S/loaded ;;
+  load)   shift; key=$1; id=""; ctx=""
+          while (( $# )); do case $1 in --identifier) id=$2; shift;; --context-length) ctx=$2; shift;; esac; shift; done
+          sleep ${FAKE_LOAD_SECS:-1}
+          print -r -- "[{\"type\":\"llm\",\"identifier\":\"$id\",\"modelKey\":\"$key\",\"contextLength\":$ctx}]" > $S/loaded
+          print -r -- "$(date +%T) load-done $key" >> $L ;;
+esac
+exit 0

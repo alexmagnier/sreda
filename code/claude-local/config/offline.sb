@@ -1,0 +1,89 @@
+;; offline.sb — macOS kernel sandbox for `claude-local` offline mode.
+;; Applies to Claude Code AND every child process (Bash, scripts, git, python, …).
+;; Params (passed with -D by the launcher):
+;;   WORKDIR  folder the session was started in      CONFDIR  ~/.claude-local (history, state, tmp)
+;;   REPO     the harness repo (launcher code)       HOME     the user's home folder
+(version 1)
+(allow default)
+
+;; --- network: nothing leaves the Mac --------------------------------------------------------
+;; Denies TCP/UDP to any host AND unix sockets (incl. the system DNS resolver socket), so even
+;; name lookups fail. The only allowed peer is the local LM Studio API.
+(deny network-outbound)
+(allow network-outbound (remote ip "localhost:1234"))
+
+;; --- unsandboxed helpers that would carry data out for us (adversarial review 2026-11-16) ---
+;; `open URL` / osascript `open location` → LaunchServices → browser outside the sandbox;
+;; pbcopy → pasteboard (Universal Clipboard syncs to other devices); background NSURLSession →
+;; nsurlsessiond does the download on our behalf.
+(deny appleevent-send)
+(deny mach-lookup
+  (global-name "com.apple.coreservices.launchservicesd")
+  (global-name "com.apple.coreservices.quarantine-resolver")
+  (global-name "com.apple.lsd.mapdb")
+  (global-name "com.apple.lsd.modifydb")
+  (global-name "com.apple.lsd.openwith")
+  (global-name "com.apple.lsd.icons")
+  (global-name "com.apple.pasteboard.1")
+  (global-name "com.apple.nsurlsessiond")
+  (global-name "com.apple.nsurlsessiond.NSURLSessionProxyService"))
+
+;; --- files: writes only in the working folder and Claude Code's runtime state --------------
+;; /tmp and the per-user temp dir are NOT writable: nothing can be staged there for a later
+;; online session (the launcher points TMPDIR and CLAUDE_CODE_TMPDIR into CONFDIR/tmp).
+(define (home p) (string-append (param "HOME") p))
+(define (dhome p) (string-append "/System/Volumes/Data" (param "HOME") p))
+(define (conf p) (string-append (param "CONFDIR") p))
+(deny file-write*)
+(allow file-write*
+  (subpath (param "WORKDIR"))
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/tty")
+  (literal "/dev/dtracehelper")
+  (regex #"^/dev/ttys[0-9]+$")
+  (regex #"^/dev/fd/"))
+;; the config dir: only Claude Code's runtime state (keep in sync with tools/guard.py CONF_WRITABLE_*).
+;; CLAUDE.md, rules/, settings*.json, skills/, agents/, hooks, plugins/, keybindings.json, bin/ (the
+;; pinned binary!) shape every later session and stay read-only (review 2026-11-16 night: rules/ was open).
+(deny file-write* (subpath (param "CONFDIR")))
+(allow file-write*
+  (subpath (conf "/projects")) (subpath (conf "/sessions")) (subpath (conf "/session-env"))
+  (subpath (conf "/shell-snapshots")) (subpath (conf "/todos")) (subpath (conf "/file-history"))
+  (subpath (conf "/tmp")) (subpath (conf "/backups")) (subpath (conf "/logs")) (subpath (conf "/debug"))
+  (subpath (conf "/plans")) (subpath (conf "/statsig")) (subpath (conf "/cache")) (subpath (conf "/paste-cache"))
+  (subpath (conf "/image-cache")) (subpath (conf "/state")) (subpath (conf "/ide")) (subpath (conf "/telemetry"))
+  (subpath (conf "/usage-data"))
+  (prefix (conf "/.claude.json")) (prefix (conf "/history.jsonl")) (prefix (conf "/.last-cleanup"))
+  (prefix (conf "/mcp-needs-auth-cache.json")))
+
+;; --- never writable, even when the work folder contains them -------------------------------
+;; Everything that defines a LATER launch outside this sandbox: the launcher and its profiles, the
+;; VS Code instances' settings (claudeProcessWrapper!), login items, shell startup files, the cloud
+;; Claude config, the online-mode config.
+(deny file-write*
+  (subpath (param "REPO"))
+  (subpath (string-append "/System/Volumes/Data" (param "REPO")))
+  (subpath (home "/Library"))          (subpath (dhome "/Library"))
+  (subpath (home "/.claude"))          (subpath (dhome "/.claude"))
+  (subpath (home "/.claude-local-net")) (subpath (dhome "/.claude-local-net"))
+  (subpath (home "/.claude-island"))
+  (subpath (home "/.local"))           (subpath (dhome "/.local"))
+  (subpath (home "/.config"))          (subpath (dhome "/.config"))
+  (subpath (home "/.ssh"))             (subpath (dhome "/.ssh"))
+  (subpath (home "/.lmstudio"))        (subpath (dhome "/.lmstudio"))
+  (subpath (home "/.vscode"))          (subpath (dhome "/.vscode"))
+  (literal (home "/.zshrc")) (literal (home "/.zprofile")) (literal (home "/.zshenv")) (literal (home "/.zlogin"))
+  (literal (home "/.zlogout")) (literal (home "/.bashrc")) (literal (home "/.bash_profile")) (literal (home "/.profile"))
+  (literal (home "/.gitconfig")) (literal (home "/.npmrc")) (literal (home "/.curlrc"))
+  (literal (dhome "/.zshrc")) (literal (dhome "/.zprofile")) (literal (dhome "/.zshenv")) (literal (dhome "/.gitconfig")))
+;; …and code that an unsandboxed program runs or obeys later, wherever it is (review 2026-11-16 night:
+;; git core.fsmonitor planted in the work folder ran on the next normal `git status` and sent a canary out).
+;; Keep in sync with tools/guard.py LATER_EXEC_REGEXES.
+(deny file-write*
+  (regex #"/\.git/(config|hooks|info|modules)(/|$)") (regex #"/\.git/config\.lock$") (regex #"/\.gitmodules$")
+  (regex #"/\.(vscode|idea|devcontainer)(/|$)") (regex #"/\.envrc$")
+  (regex #"/\.claude/(settings[^/]*\.json|hooks|agents|commands|skills|rules)")
+  (regex #"/\.mcp\.json$") (regex #"/projects/[^/]+/memory(/|$)"))
+;; the launcher's lock: a session must not be able to hold it (it would block every later start)
+(deny file-read* file-write* (subpath (home "/Library/Caches/claude-local-locks")))

@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.pyc
+.build/
+# generated on the user's Mac by tests
+code/claude-local/docs/
+code/claude-local/tests/eval/results-*.json
+code/claude-local/bin/claude-local-vscode
+code/claude-local/bin/claude-lab-vscode

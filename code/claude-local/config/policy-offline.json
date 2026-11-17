@@ -1,0 +1,44 @@
+{
+  "disableClaudeAiConnectors": true,
+  "skipWebFetchPreflight": true,
+  "includeCoAuthoredBy": false,
+  "cleanupPeriodDays": 30,
+  "sandbox": {
+    "enabled": false
+  },
+  "permissions": {
+    "defaultMode": "default",
+    "deny": [
+      "WebSearch",
+      "WebFetch",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(rsync *)",
+      "Bash(git push *)",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "EnterWorktree",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "TaskStop",
+      "Workflow",
+      "RemoteTrigger",
+      "PushNotification",
+      "mcp__claude-in-chrome",
+      "mcp__claude-vscode-extension"
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "__HARNESS_HOME__/bin/statusline.sh"
+  },
+  "_comment_tools": "Tools the local model does not need are denied: denied tools are not sent to the model, the prompt gets shorter and the first answer faster."
+}

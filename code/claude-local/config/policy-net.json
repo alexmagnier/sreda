@@ -1,0 +1,56 @@
+{
+  "disableClaudeAiConnectors": true,
+  "skipWebFetchPreflight": true,
+  "includeCoAuthoredBy": false,
+  "cleanupPeriodDays": 30,
+  "sandbox": {
+    "enabled": false
+  },
+  "permissions": {
+    "defaultMode": "default",
+    "allow": [
+      "mcp__web-tools__web_search",
+      "mcp__web-tools__web_fetch"
+    ],
+    "deny": [
+      "WebSearch",
+      "WebFetch",
+      "Read(~/.ssh/**)",
+      "Read(~/.claude/**)",
+      "Read(~/.claude-local/**)",
+      "Read(~/Library/Keychains/**)",
+      "Read(~/Library/Application Support/Syncthing/**)",
+      "mcp__claude-vscode__openFile",
+      "mcp__claude-vscode__getCurrentSelection",
+      "mcp__claude-vscode__getLatestSelection",
+      "mcp__claude-vscode__getDiagnostics",
+      "mcp__claude-vscode__executeCode",
+      "mcp__claude-vscode__getOpenEditors",
+      "mcp__ide__getDiagnostics",
+      "mcp__ide__executeCode",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "EnterWorktree",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "TaskStop",
+      "Workflow",
+      "RemoteTrigger",
+      "PushNotification",
+      "mcp__claude-in-chrome",
+      "mcp__claude-vscode-extension"
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "__HARNESS_HOME__/bin/statusline.sh"
+  },
+  "_comment_ide": "VS Code IDE tools run in the (unsandboxed) extension host: in the online mode they could open and read a client file past the kernel sandbox — denied.",
+  "_comment_tools": "Tools the local model does not need are denied: denied tools are not sent to the model, the prompt gets shorter and the first answer faster."
+}

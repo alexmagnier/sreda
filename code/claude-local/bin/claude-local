@@ -1,0 +1,452 @@
+#!/bin/zsh
+# claude-local — Claude Code on a LOCAL model served by LM Studio (127.0.0.1:1234).
+#
+# Fail-closed by design:
+#  * local server/model not ready → Claude Code is NOT started;
+#  * the config dirs contain no claude.ai login → nothing to fall back to;
+#  * BOTH modes run Claude Code inside a macOS kernel sandbox (sandbox-exec), inherited by Bash,
+#    MCP servers and every child process:
+#      offline — network ONLY to 127.0.0.1:1234, no LaunchServices/AppleEvents/pasteboard,
+#                writes only in the work folder and the session state;
+#      online  — internet allowed, but the home folder is closed except the work folder and what
+#                the session needs; client folders and secrets are closed even inside it;
+#  * offline and online modes use separate config dirs and temp dirs (history never crosses).
+# Security helpers live in tools/guard.py; the sandbox and policy are rebuilt on every launch.
+#
+# VS Code: the same script is the "claudeCode.claudeProcessWrapper" of two isolated VS Code instances
+# (bin/local-vscode). Invoked as claude-local-vscode / claude-lab-vscode it receives
+# <bundled claude path> <SDK args…>, drops the bundled binary and runs the PINNED one under the same
+# sandbox, env and policy. Our flags are appended AFTER the SDK args and the SDK's own --model,
+# --setting-sources, --strict-mcp-config, --debug-file are removed, so ours are the only ones.
+
+setopt ERR_EXIT NO_UNSET PIPE_FAIL
+
+usage() {
+  cat <<'EOF'
+claude-local — Claude Code на локальной модели (данные не уходят в облако)
+
+  claude-local                 рабочая модель, БЕЗ интернета — для клиентских файлов
+  claude-local --web           рабочая модель + поиск/чтение сайтов (клиентские папки закрыты)
+  claude-lab                   модель без фильтров + интернет — лаборатория
+  claude-lab --offline         модель без фильтров, без интернета
+
+  claude-local --status        что запущено и сколько свободно памяти
+  claude-local --stop          выгрузить модель из памяти
+  claude-local --pin-binary    закрепить свежий Claude Code из VS Code (потом tests/verify.sh)
+  claude-local --purge-logs    удалить логи LM Studio (в них фрагменты запросов)
+  claude-local --preload       только загрузить модель (VS Code делает это сам)
+  local-vscode work|lab [ПАПКА]  чат в VS Code на локальной модели (то же, что программы
+                               «Локальный Claude» и «Лаборатория Claude»)
+
+Остальные аргументы уходят в Claude Code: -c (продолжить), -r (выбрать сессию), -p "вопрос".
+Инструкция: ~/local-ai/НАЧНИ-ЗДЕСЬ.md (её создаёт установщик)
+EOF
+}
+
+HARNESS_HOME="${0:A:h:h}"                         # repo dir (bin/..), symlinks resolved
+CONF_OFFLINE="$HOME/.claude-local"                # history of offline sessions (client data)
+CONF_NET="$HOME/.claude-local-net"                # history of sessions with internet
+CLAUDE_PINNED="$CONF_OFFLINE/bin/claude"
+PORT="${CLAUDE_LOCAL_PORT:-1234}"                 # override only for tests
+BASE_URL="http://127.0.0.1:$PORT"
+GUARD=(/usr/bin/python3 -I "$HARNESS_HOME/tools/guard.py")
+CLIENT_LIST="$HARNESS_HOME/config/client-folders.list"
+# Outside both sandboxes (neither can read or write here): a session can't hold the lock and block starts.
+LOCK_DIR="${CLAUDE_LOCAL_LOCK_DIR:-$HOME/Library/Caches/claude-local-locks}"   # override only for tests
+# Tests may ADD client folders (never remove them). The merged copy lives in LOCK_DIR: outside both sandboxes.
+if [[ -n "${CLAUDE_LOCAL_EXTRA_CLIENT_LIST:-}" && -f "$CLAUDE_LOCAL_EXTRA_CLIENT_LIST" ]]; then
+  mkdir -p "$LOCK_DIR" && cat "$CLIENT_LIST" "$CLAUDE_LOCAL_EXTRA_CLIENT_LIST" > "$LOCK_DIR/clients.merged" \
+    && CLIENT_LIST="$LOCK_DIR/clients.merged"
+fi
+
+# Models: LM Studio model key (see `lms ls`) → API identifier, context window, label.
+# Set ONLY in config/models.env (the installer fills it for this Mac's memory; see 02_ВЫБОР-МОДЕЛЕЙ.md).
+# The repo is read-only for both sandboxes, so a session cannot change which model runs next time.
+source "$HARNESS_HOME/config/models.env"
+WORK_KEY="${CLAUDE_LOCAL_WORK_KEY:-$WORK_KEY}"
+LAB_KEY="${CLAUDE_LOCAL_LAB_KEY:-$LAB_KEY}"
+
+if [[ -t 2 ]]; then c_red=$'\e[31m'; c_grn=$'\e[32m'; c_ylw=$'\e[33m'; c_bold=$'\e[1m'; c_off=$'\e[0m'
+else c_red=""; c_grn=""; c_ylw=""; c_bold=""; c_off=""; fi        # VS Code shows stderr as plain text
+die()  { print -u2 -- "${c_red}✖ claude-local: $*${c_off}"
+         (( ${vscode:-0} )) && [[ -n "${CONF:-}" ]] && { mkdir -p "$CONF/logs"; print -r -- "$(date '+%F %T') pid=$$ REFUSED: ${1%%$'\n'*}" >> "$CONF/logs/vscode-wrapper.log" 2>/dev/null; }
+         exit 1; }
+info() { print -u2 -- "${c_ylw}… $*${c_off}"; }
+
+find_lms() {
+  if [[ -n "${CLAUDE_LOCAL_LMS:-}" ]]; then   # test hook: only the harness's own fakes, never an arbitrary program
+    [[ "$CLAUDE_LOCAL_LMS" == /usr/bin/false || "${CLAUDE_LOCAL_LMS:A}" == "${HARNESS_HOME:A}/tests/"* ]] \
+      || { print -u2 -- "claude-local: CLAUDE_LOCAL_LMS разрешён только для тестов харнесса"; return 1; }
+    print -r -- "$CLAUDE_LOCAL_LMS"; return 0
+  fi
+  local p
+  for p in "$HOME/.lmstudio/bin/lms" "/Applications/LM Studio.app/Contents/Resources/app/.webpack/lms"; do
+    [[ -x "$p" ]] && { print -r -- "$p"; return 0; }
+  done
+  return 1
+}
+
+server_up() { [[ "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "$BASE_URL/v1/models" 2>/dev/null)" == 200 ]]; }
+
+loaded_ids() {
+  curl -s -m 5 "$BASE_URL/v1/models" 2>/dev/null \
+    | /usr/bin/python3 -I -c 'import sys,json; print("\n".join(m["id"] for m in json.load(sys.stdin).get("data",[])))' 2>/dev/null || true
+}
+
+# The API port must listen on loopback only — never on the LAN.
+assert_loopback_only() {
+  local addrs a
+  addrs=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $9}' | sed 's/:[0-9]*$//' | sort -u)
+  [[ -n "$addrs" ]] || return 0
+  for a in ${(f)addrs}; do
+    [[ "$a" == "127.0.0.1" || "$a" == "[::1]" || "$a" == "localhost" ]] \
+      || die "сервер LM Studio слушает не только этот компьютер ($a). Выключи «Serve on Local Network» в LM Studio."
+  done
+}
+
+ensure_server() {
+  if ! server_up; then
+    local lms i; lms=$(find_lms) || die "LM Studio не найден. Установи: brew install --cask lm-studio"
+    info "Запускаю LM Studio сервер на 127.0.0.1:$PORT"
+    # ELECTRON_RUN_AS_NODE leaks from VS Code's extension host and turns LM Studio into bare node.
+    pgrep -qf "LM Studio.app/Contents/MacOS" || { env -u ELECTRON_RUN_AS_NODE open -g -a "LM Studio" 2>/dev/null || true; }
+    local tries=15 waits=20; (( ${vscode:-0} )) && { tries=6; waits=8; }
+    for i in {1..$tries}; do
+      "$lms" server start --port "$PORT" --bind 127.0.0.1 >/dev/null 2>&1 && break
+      sleep 2
+    done
+    for i in {1..$waits}; do server_up && break; sleep 1; done
+    server_up || die "сервер LM Studio не поднялся. Открой приложение LM Studio и повтори. В облако НЕ ухожу."
+  fi
+  assert_loopback_only
+}
+
+# Exactly the expected model must be loaded: same identifier AND model key AND context window,
+# and nothing else (a second model would not fit in memory next to it).
+model_ready() {   # $1 lms, $2 key, $3 id
+  "$1" ps --json 2>/dev/null | /usr/bin/python3 -I -c '
+import sys, json
+key, mid, ctx = sys.argv[1], sys.argv[2], int(sys.argv[3])
+llms = [m for m in json.load(sys.stdin) if m.get("type") == "llm"]
+ok = len(llms) == 1 and llms[0].get("identifier") == mid and llms[0].get("modelKey") == key \
+     and llms[0].get("contextLength") == ctx
+sys.exit(0 if ok else 1)' "$2" "$3" "$CTX"
+}
+
+# One model fits in memory. A running session of a profile holds a SHARED "lease" on
+# $LOCK_DIR/lease-<profile> for its whole life (fd kept across exec); switching to the other model is
+# refused while that lease is held — otherwise opening the Lab would kill an answer in the work window.
+other_profile_busy() {   # $1 work|lab → 0 if a session of that profile is running
+  local f="$LOCK_DIR/lease-$1" fd=""
+  [[ -e "$f" ]] || return 1
+  if zsystem flock -t 0 -f fd "$f" 2>/dev/null; then zsystem flock -u $fd; return 1; fi
+  return 0
+}
+
+# On battery a local model drains a laptop fast (~60-100 W while generating): say so once per start.
+battery_note() {
+  local b pct
+  b=$(pmset -g batt 2>/dev/null) || return 0
+  [[ "$b" == *"Battery Power"* ]] || return 0
+  pct=$(print -r -- "$b" | grep -Eo '[0-9]+%' | head -1 | tr -d '%')
+  [[ -n "$pct" ]] || return 0
+  print -u2 -- "${c_ylw}🔋 Mac на батарее (${pct}%): пока модель пишет ответ, она тратит энергию как тяжёлая игра. Лучше от зарядки.${c_off}"
+  (( pct < 15 )) && die "заряд ${pct}% — модель не загружаю: подключи зарядку (иначе Mac выключится посреди ответа)."
+  return 0
+}
+
+ensure_model() {   # $1 key, $2 id   (call under the model lock)
+  local key=$1 id=$2 lms other aborted=0
+  lms=$(find_lms) || die "LM Studio CLI не найден"
+  model_ready "$lms" "$key" "$id" && return 0
+  other=work; [[ $profile == work ]] && other=lab
+  if other_profile_busy $other; then
+    [[ $other == lab ]] && die "сейчас в памяти модель Лаборатории, и ею пользуются (открыт чат «Лаборатория Claude»
+  или сессия claude-lab). Две модели в память не помещаются: закрой окно/чат Лаборатории и повтори."
+    die "сейчас в памяти рабочая модель, и ею пользуются (открыт чат «Локальный Claude» или сессия claude-local).
+  Две модели в память не помещаются: закрой окно/чат «Локальный Claude» и повтори."
+  fi
+  info "Загружаю модель $id в память (до минуты)…"
+  # killed mid-load (VS Code retries a slow start): finish the load first, so a retry never starts a second one
+  trap 'aborted=1' TERM HUP INT
+  "$lms" unload --all >/dev/null 2>&1 || true      # one model at a time
+  "$lms" load "$key" --identifier "$id" --context-length "$CTX" --parallel 1 --gpu max -y >/dev/null 2>&1 \
+    || { trap - TERM HUP INT; die "не удалось загрузить $key (проверь: $lms ls). В облако НЕ ухожу."; }
+  trap - TERM HUP INT
+  (( aborted )) && exit 143
+  model_ready "$lms" "$key" "$id" || die "после загрузки в памяти не та модель (ожидалась $key как $id)"
+  loaded_ids | grep -qx -- "$id" || die "модель $id не появилась в API после загрузки"
+}
+
+# Server + model under the MODEL lock (separate from the short setup lock: config probes and
+# utilities of the VS Code extension never wait for a model load). $1 = lease → keep a lease after.
+model_up() {
+  local mfd="" wait=180; (( vscode )) && wait=40
+  mkdir -p "$LOCK_DIR"; : >> "$LOCK_DIR/model.lock"
+  zsystem flock -t $wait -f mfd "$LOCK_DIR/model.lock" 2>/dev/null \
+    || die "модель сейчас загружается другим запуском. Подожди минуту и повтори."
+  battery_note
+  ensure_server
+  ensure_model "$KEY" "$MID"
+  if [[ "${1:-}" == lease ]]; then
+    : >> "$LOCK_DIR/lease-$profile"
+    zsystem flock -r -e -f leasefd "$LOCK_DIR/lease-$profile" 2>/dev/null || true   # inherited by Claude Code
+  fi
+  zsystem flock -u $mfd
+}
+
+pin_binary() {
+  local dirs=( "$HOME"/.vscode/extensions/anthropic.claude-code-*-darwin-arm64(Nn/) )
+  (( ${#dirs} )) || die "расширение Claude Code для VS Code не найдено"
+  local src="${dirs[-1]}/resources/native-binary/claude"
+  [[ -x "$src" ]] || die "в расширении нет бинаря: $src"
+  # Developer ID of Anthropic PBC (Team ID Q6L2SF6YDW) — not just "some valid signature"
+  codesign --verify --strict -R='anchor apple generic and certificate leaf[subject.OU] = "Q6L2SF6YDW"' "$src" 2>/dev/null \
+    || die "бинарь не подписан Anthropic (ожидался Team ID Q6L2SF6YDW): $src"
+  mkdir -p "${CLAUDE_PINNED:h}"
+  [[ -x "$CLAUDE_PINNED" ]] && cp -p "$CLAUDE_PINNED" "$CLAUDE_PINNED.prev"
+  cp -p "$src" "$CLAUDE_PINNED"
+  print -u2 -- "${c_grn}✔ закреплён Claude Code $("$CLAUDE_PINNED" --version 2>/dev/null | head -1)${c_off}"
+  print -u2 -- "  Предыдущая версия сохранена: $CLAUDE_PINNED.prev"
+  print -u2 -- "  Обязательно прогони проверку: $HARNESS_HOME/tests/verify.sh"
+}
+
+show_status() {
+  local lms; lms=$(find_lms) || die "LM Studio не установлен"
+  if server_up; then print -- "Сервер: ${c_grn}работает${c_off} ($BASE_URL, доступен только с этого Mac)"
+  else print -- "Сервер: ${c_ylw}остановлен${c_off} (запустится сам при claude-local)"; fi
+  print -- "В памяти:"; "$lms" ps 2>/dev/null | sed 's/^/  /' || true
+  print -- "Свободно памяти: $(memory_pressure 2>/dev/null | awk '/free percentage/ {print $NF}')"
+  print -- "Claude Code (закреплён): $("$CLAUDE_PINNED" --version 2>/dev/null | head -1 || print 'нет')"
+}
+
+# LM Studio's server log stores request bodies (fragments of client files). Deleted on every launch.
+purge_logs() {
+  local dir="$HOME/.lmstudio/server-logs"
+  [[ -d "$dir" ]] || return 0
+  find "$dir" -type f -name '*.log' -delete 2>/dev/null || true
+  [[ "${1:-}" == verbose ]] && print -u2 -- "${c_grn}✔ логи сервера LM Studio удалены${c_off}"
+  return 0
+}
+
+zmodload zsh/system
+# ---------- arguments ----------
+profile=work; mode=""; force=0; vscode=0; kind=session; preload=0; check_folder=0
+case "${0:t}" in
+  claude-lab)          profile=lab ;;
+  claude-local-vscode) vscode=1 ;;
+  claude-lab-vscode)   vscode=1; profile=lab ;;
+esac
+pass=()
+if (( vscode )); then
+  # argv[1] = the extension's bundled binary — never executed, the pinned copy is.
+  [[ "${1:-}" == */native-binary/claude ]] && shift
+  sdk_session=0
+  while (( $# )); do
+    case "$1" in
+      --output-format=stream-json) sdk_session=1; pass+=("$1") ;;
+      --output-format) pass+=("$1"); shift; [[ "${1:-}" == stream-json ]] && sdk_session=1; (( $# )) && pass+=("$1") ;;
+      --model=*|--fallback-model=*|--setting-sources=*|--debug-file=*|--strict-mcp-config) ;;   # ours win
+      --debug|--debug=*|--debug-to-stderr|--verbose-debug) ;;   # debug lines would land in VS Code's on-disk logs
+      --model|--fallback-model|--setting-sources|--debug-file) shift ;;
+      --claude-in-chrome-mcp|--chrome|--chrome=*)                      # bridge to the real, unsandboxed Chrome
+        print -u2 -- "claude-local: Chrome-мост отключён в локальном режиме"; exit 1 ;;
+      *) pass+=("$1") ;;
+    esac
+    (( $# )) && shift
+  done
+  if (( ! sdk_session )); then kind=utility                                   # auth status, workspace-trust…
+  elif [[ -n "${CLAUDE_CODE_CONFIG_PROBE:-}${CLAUDE_CODE_SAFE_MODE:-}" ]]; then kind=probe   # settings/config reads
+  fi
+  [[ $profile == lab ]] && mode=net || mode=offline
+  set --
+fi
+while (( $# )); do
+  case "$1" in
+    --web)        mode=net ;;
+    --offline)    mode=offline ;;
+    --lab)        profile=lab ;;
+    --work)       profile=work ;;
+    --i-know)     force=1 ;;
+    --status)     show_status; exit 0 ;;
+    --stop)       l=$(find_lms) && "$l" unload --all; exit 0 ;;
+    --pin-binary) pin_binary; exit 0 ;;
+    --purge-logs) purge_logs verbose; exit 0 ;;
+    --preload)    preload=1 ;;
+    --check-folder) check_folder=1 ;;
+    --vscode)     shift; exec "$HARNESS_HOME/bin/local-vscode" work "${1:-$PWD}" ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            pass+=("$1") ;;
+  esac
+  shift
+done
+[[ -z "$mode" ]] && { [[ $profile == lab ]] && mode=net || mode=offline; }
+
+if [[ $profile == lab ]]; then KEY=$LAB_KEY; MID=$LAB_ID; CTX=$LAB_CTX; LABEL=$LAB_LABEL
+else KEY=$WORK_KEY; MID=$WORK_ID; CTX=$WORK_CTX; LABEL=$WORK_LABEL; fi
+
+# --preload: start the server and load this profile's model, nothing else (VS Code launcher, before the window)
+if (( preload )); then
+  CONF=$CONF_OFFLINE; [[ $mode == net ]] && CONF=$CONF_NET
+  mkdir -p "$CONF"
+  model_up
+  print -u2 -- "${c_grn}✔ модель $MID готова${c_off}"
+  # Warm-up: one tiny request with the full Claude Code prompt fills LM Studio's prompt cache, so the
+  # user's first message re-reads only the folder-specific part (~10 s → ~4 s to the first word).
+  if [[ "${CLAUDE_LOCAL_NO_WARM:-}" != 1 ]]; then
+    warm="$HOME/.cache/claude-local-warm/$profile"; mkdir -p "$warm"
+    flags=(); [[ $profile == lab ]] && flags+=(--lab); [[ $mode == net ]] && flags+=(--web) || flags+=(--offline)
+    ( cd "$warm" && CLAUDE_LOCAL_NO_WARM=1 "$HARNESS_HOME/bin/claude-local" "${flags[@]}" \
+        -p "ok" --max-turns 1 --no-session-persistence </dev/null >/dev/null 2>&1 ) \
+      && print -u2 -- "${c_grn}✔ кэш промпта прогрет${c_off}" || print -u2 -- "… прогрев не удался (не страшно)"
+  fi
+  exit 0
+fi
+
+CONF=$CONF_OFFLINE; [[ $mode == net ]] && CONF=$CONF_NET
+WORKDIR="${PWD:A}"
+# Folders that hold many projects at once (client ones among them): never a work folder as a whole.
+# config/broad-roots.list, one path per line (~ allowed); tests may ADD a list via CLAUDE_LOCAL_EXTRA_BROAD_ROOTS.
+is_broad_root() {
+  local f r
+  for f in "$HARNESS_HOME/config/broad-roots.list" "${CLAUDE_LOCAL_EXTRA_BROAD_ROOTS:-}"; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    while IFS= read -r r || [[ -n "$r" ]]; do
+      r="${r%"${r##*[![:space:]]}"}"
+      [[ -z "$r" || "$r" == \#* ]] && continue
+      r="${r/#\~/$HOME}"
+      [[ -e "$r" ]] || continue
+      "${GUARD[@]}" same "$WORKDIR" "$r" && return 0
+    done < "$f"
+  done
+  return 1
+}
+# Any mode: never the home folder itself (or / and /Users), never a service folder. With the home folder
+# as the work folder every file in it would be writable for the session.
+if [[ "$WORKDIR" == /System/Volumes* ]] || "${GUARD[@]}" inside "$HOME" "$WORKDIR" || is_broad_root \
+   || "${GUARD[@]}" inside "$WORKDIR" "$CONF_OFFLINE" "$CONF_NET" "$HOME/.claude" "$HOME/.ssh" "$HOME/.lmstudio" "$HOME/Library" \
+        "$HARNESS_HOME" "/Applications"; then
+  die "не та папка: ${WORKDIR/#$HOME/~} — слишком широкая или служебная (домашняя, корень всех проектов, ~/Library, конфиги, сам харнесс).
+  Открой папку конкретного проекта (в VS Code: Файл → Открыть папку; в терминале: cd <папка проекта>)."
+fi
+if [[ $mode == net ]]; then
+  clients=("${(@f)$("${GUARD[@]}" clients "$CLIENT_LIST")}")
+  if "${GUARD[@]}" inside "$WORKDIR" $clients && (( ! force )); then
+    (( vscode )) || [[ "${CLAUDE_LOCAL_UI:-}" == vscode ]] && die "«${WORKDIR:t}» — клиентская папка. В Лаборатории (с интернетом) с ней работать нельзя:
+  страница из сети может подсунуть модели инструкцию вынести данные. Открой папку в «Локальный Claude»."
+    die "это клиентская папка (${WORKDIR:t}). Режим с интернетом здесь запрещён: страница из сети может
+  подсунуть модели инструкцию вынести данные. Запусти без --web или перейди в другую папку.
+  (Осознанный обход: --i-know — но клиентские папки всё равно останутся закрыты песочницей)"
+  fi
+  # never resume an offline transcript in an online session (offline history = client data):
+  # session ids are plain UUIDs/names; a value with "/" or ".jsonl" is a file path → refuse.
+  for (( i = 1; i <= ${#pass}; i++ )); do
+    a=${pass[i]}; v=""
+    case "$a" in
+      -r|--resume|--session-id|--fork-session) (( i < ${#pass} )) && v=${pass[i+1]} ;;
+      --resume=*|--session-id=*)               v=${a#*=} ;;
+      -r?*)                                    v=${a#-r} ;;          # attached form: -r/path/x.jsonl
+    esac
+    if [[ "$v" == */* || "$v" == *.jsonl ]]; then
+      die "в режиме с интернетом нельзя открывать сессию по пути к файлу ($v) — офлайн-история туда не переносится."
+    fi
+  done
+fi
+(( check_folder )) && { print -u2 -- "${c_grn}✔ папка подходит: ${WORKDIR/#$HOME/~}${c_off}"; exit 0; }   # local-vscode asks before opening
+
+[[ -x "$CLAUDE_PINNED" ]] || die "нет закреплённого Claude Code. Запусти: $HARNESS_HOME/install.sh"
+CONF=$CONF_OFFLINE; [[ $mode == net ]] && CONF=$CONF_NET
+[[ -f "$CONF/.claude.json" ]] || die "харнесс не установлен: запусти $HARNESS_HOME/install.sh"
+
+# VS Code: one line per start (no prompts, no file contents) — what the window asked for and what ran.
+vlog() {
+  (( vscode )) || return 0
+  local f="$CONF/logs/vscode-wrapper.log"; mkdir -p "${f:h}"
+  print -r -- "$(date '+%F %T') pid=$$ mode=$mode kind=$kind cwd=${WORKDIR/#$HOME/~} $*" >> "$f" 2>/dev/null || true
+  if [[ $(wc -l < "$f" 2>/dev/null || print 0) -gt 2000 ]]; then tail -n 500 "$f" > "$f.tmp" && mv "$f.tmp" "$f"; fi
+}
+vlog start
+mkdir -p "$CONF/tmp"
+leasefd=""
+if [[ $kind == session && "${CLAUDE_LOCAL_DRYRUN:-}" != 1 ]]; then
+  model_up lease
+  purge_logs
+fi
+# Several processes may start at once (VS Code: chat + config probes) — config setup under a short lock.
+lockfd=""
+LOCK="$LOCK_DIR/$([[ $mode == net ]] && print net || print offline).lock"; mkdir -p "$LOCK_DIR"; : >> "$LOCK"
+zsystem flock -t 30 -f lockfd "$LOCK" 2>/dev/null || die "занято другим запуском — повтори"
+"${GUARD[@]}" sync-skills "$CONF" "$HARNESS_HOME/config/$([[ $mode == net ]] && print skills-net.list || print skills.list)" \
+  || die "не удалось проверить список скиллов"
+"${GUARD[@]}" policy "$mode" "$HARNESS_HOME/config/policy-$mode.json" "$CONF/.policy.json" "$CLIENT_LIST" 2>/dev/null
+"${GUARD[@]}" trust "$CONF" "$WORKDIR" || true       # the trust dialog defaults to "No, exit"
+
+# ---------- environment: everything points to the local server ----------
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+      CLAUDE_CODE_USE_FOUNDRY CLAUDE_SECURESTORAGE_CONFIG_DIR ELECTRON_RUN_AS_NODE CLAUDECODE \
+      CLAUDE_CODE_SSE_PORT HTTPS_PROXY HTTP_PROXY ALL_PROXY https_proxy http_proxy all_proxy \
+      ANTHROPIC_CUSTOM_HEADERS ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL 2>/dev/null || true
+(( vscode )) || unset CLAUDE_CODE_ENTRYPOINT     # VS Code sets claude-vscode — keep it there
+unset SSH_AUTH_SOCK SSH_AGENT_PID GIT_ASKPASS SSH_ASKPASS 2>/dev/null || true   # no access to your SSH keys/servers
+# tool caches inside the session's own dir: ~/.npm/_npx, ~/.cache, ~/Library/Caches hold code that runs later
+export npm_config_cache="$CONF/cache/npm" PIP_CACHE_DIR="$CONF/cache/pip" UV_CACHE_DIR="$CONF/cache/uv" \
+       XDG_CACHE_HOME="$CONF/cache" HF_HOME="$CONF/cache/hf"
+export CLAUDE_CONFIG_DIR="$CONF"
+export TMPDIR="$CONF/tmp" CLAUDE_CODE_TMPDIR="$CONF/tmp"   # per-mode temp: nothing shared via /tmp
+export ANTHROPIC_BASE_URL="$BASE_URL"
+export ANTHROPIC_AUTH_TOKEN="lmstudio-local"           # dummy: the local server ignores it
+export ANTHROPIC_MODEL="$MID"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MID" ANTHROPIC_DEFAULT_SONNET_MODEL="$MID"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MID" ANTHROPIC_DEFAULT_FABLE_MODEL="$MID"
+export CLAUDE_CODE_SUBAGENT_MODEL="$MID" CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CTX"
+(( CTX >= 100000 )) && export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$CTX"   # env accepts 100000..1000000 only
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000
+export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+# no calls to Anthropic or anyone else (offline mode additionally enforces this in the kernel)
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1
+export CLAUDE_CODE_DISABLE_FEATURE_FLAGS=1 DISABLE_GROWTHBOOK=1
+export DISABLE_AUTOUPDATER=1 DISABLE_UPDATES=1 DISABLE_FEEDBACK_COMMAND=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
+export DISABLE_LOGIN_COMMAND=1 ENABLE_CLAUDEAI_MCP_SERVERS=false CLAUDE_CODE_AUTO_CONNECT_IDE=false
+export CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1 CLAUDE_CODE_DISABLE_ARTIFACT=1
+export CLAUDE_CODE_DISABLE_WEB_FETCH=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+# Each of these is an extra request with the whole context to the (slow) local model — off.
+export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES=1
+export CLAUDE_CODE_ENABLE_AWAY_SUMMARY=false
+export CLAUDE_LOCAL_MODE="$mode" CLAUDE_LOCAL_LABEL="$LABEL"   # for the status line
+[[ $profile == lab ]] && export WEB_TOOLS_ALLOW_LAN=1          # lab may reach devices on the LAN
+
+common=(--settings "$CONF/.policy.json" --setting-sources user --strict-mcp-config)
+mcp_file="$HARNESS_HOME/config/mcp-$mode.json"
+if (( vscode )); then
+  # SDK args first, ours last (last occurrence wins); utility subcommands get no session flags.
+  if [[ $kind == utility ]]; then argv_tail=("${pass[@]}")
+  else argv_tail=("${pass[@]}" "--model=$MID" "${common[@]}" --mcp-config "$mcp_file"); fi
+else
+  argv_tail=("${common[@]}" --mcp-config "$mcp_file" "${pass[@]}")
+fi
+if [[ $mode == net ]]; then
+  # one profile per work folder: two VS Code windows never overwrite each other's sandbox
+  sb="$CONF/.sandbox-$(print -rn -- "$WORKDIR" | /sbin/md5 -q | cut -c1-12).sb"
+  "${GUARD[@]}" sandbox-net "$sb" "$HOME" "$WORKDIR" "$CONF" "$HARNESS_HOME" "$CLAUDE_PINNED" \
+    "$CLIENT_LIST" "$HARNESS_HOME/config/net-allow.list" "$HARNESS_HOME/config/skills-net.list" 2>/dev/null \
+    || die "не удалось собрать песочницу"
+  exec {lockfd}>&-                                   # release the setup lock before exec
+  if (( ! vscode )); then
+    [[ -t 2 ]] && print -n -u2 -- $'\e]0;🌐 claude-local · интернет\a'   # window title, terminal only
+    print -u2 -- "${c_bold}${c_ylw}🌐 ЛОКАЛЬНАЯ МОДЕЛЬ · С ИНТЕРНЕТОМ${c_off} · $LABEL · домашняя папка и клиентские папки закрыты"
+  fi
+  [[ "${CLAUDE_LOCAL_DRYRUN:-}" == 1 ]] && { print -rl -- "MODE=$mode KIND=$kind SB=$sb" "${argv_tail[@]}"; exit 0; }   # tests
+  vlog exec
+  exec sandbox-exec -f "$sb" "$CLAUDE_PINNED" "${argv_tail[@]}"
+else
+  exec {lockfd}>&-
+  if (( ! vscode )); then
+    [[ -t 2 ]] && print -n -u2 -- $'\e]0;🔒 claude-local · без интернета\a'
+    print -u2 -- "${c_bold}${c_grn}🔒 ЛОКАЛЬНАЯ МОДЕЛЬ · БЕЗ ИНТЕРНЕТА${c_off} · $LABEL · сеть закрыта на уровне ядра"
+  fi
+  [[ "${CLAUDE_LOCAL_DRYRUN:-}" == 1 ]] && { print -rl -- "MODE=$mode KIND=$kind" "${argv_tail[@]}"; exit 0; }       # tests
+  vlog exec
+  exec sandbox-exec -f "$HARNESS_HOME/config/offline.sb" -D "WORKDIR=$WORKDIR" -D "CONFDIR=${CONF:A}" \
+    -D "REPO=${HARNESS_HOME:A}" -D "HOME=${HOME:A}" "$CLAUDE_PINNED" "${argv_tail[@]}"
+fi

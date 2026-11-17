@@ -1,0 +1,5 @@
+# Extra folders in your home that online sessions (--web, claude-lab) may read AND write.
+# Everything else in ~ is closed in online mode. One path per line, ~ allowed. Empty by default.
+# Add only what a lab task really needs, and never a folder with keys or tokens
+# (e.g. ~/.android holds the adb private key, ~/.ssh — SSH keys).
+# Nothing that a program executes later (npm/npx caches, ~/.cache, ~/Library/Caches).

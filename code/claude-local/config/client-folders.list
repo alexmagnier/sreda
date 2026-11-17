@@ -1,0 +1,11 @@
+# Client folders — files under NDA / personal data of third parties.
+# In modes WITH internet (claude-local --web, «Лаборатория») these folders are closed: not opened as a
+# work folder, unreadable even by absolute path, closed in the kernel sandbox even inside the work folder.
+# Work with them only in «Локальный Claude» (no internet).
+#
+# One absolute path per line (~ allowed). Matching ignores case and Unicode normalization (NFC/NFD).
+# Also list here private notes/vaults you never want an online session to read.
+# The installing agent fills this list WITH the user (01_ПЛАН-УСТАНОВКИ.md, phase 1).
+#
+# ~/Clients
+# ~/Projects/acme-corp

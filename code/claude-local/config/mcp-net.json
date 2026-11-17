@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "web-tools": {
+      "type": "stdio",
+      "command": "/opt/homebrew/bin/node",
+      "args": ["__HARNESS_HOME__/mcp/web-tools.mjs"]
+    }
+  }
+}

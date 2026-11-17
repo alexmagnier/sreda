@@ -1,0 +1,3 @@
+# Skills for sessions WITH internet («Лаборатория», claude-local --web). One per line, same format as skills.list.
+# Only generic skills here. Skills that contain client names, deal data or private methodology stay
+# offline-only (skills.list): an online session can be steered by a web page.
