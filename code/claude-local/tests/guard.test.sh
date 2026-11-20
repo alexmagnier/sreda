@@ -275,6 +275,61 @@ else
   bad "переписка сессий: нет закреплённого Claude Code ($HOME/.claude-local/bin/claude)"
 fi
 
+# --- continue a cloud session offline (20.11.2026): one way, cloud history → offline history ---
+IC="$T/imp/cloud"; IO="$T/imp/offline"; SID=11111111-2222-4333-8444-555555555555
+mkdir -p "$IC/-proj"; printf '{"a":1}\n{"b":2}\n{"partial' > "$IC/-proj/$SID.jsonl"
+$PY -I $G import-session "$SID" "$IC" "$IO" 2>/dev/null
+[[ "$(cat "$IO/-proj/$SID.jsonl" 2>/dev/null)" == $'{"a":1}\n{"b":2}' ]] && ok "импорт: облачная сессия перенесена, недописанная строка отрезана" || bad "импорт: копия не та"
+[[ "$(stat -f %Lp "$IO/-proj/$SID.jsonl" 2>/dev/null)" == 600 ]] && ok "импорт: копия только для владельца (600)" || bad "импорт: права копии не 600"
+print -r -- '{"local":1}' >> "$IO/-proj/$SID.jsonl"; $PY -I $G import-session "$SID" "$IC" "$IO" 2>/dev/null
+grep -q local "$IO/-proj/$SID.jsonl" && ok "импорт: локальное продолжение не перезаписывается" || bad "импорт: локальная копия перезаписана"
+before=$(ls -lRT "$IC" | md5)
+for junk in "../x" "$IC/-proj/$SID.jsonl" "abc" "${SID:u}" "$SID/../x" "-$SID"; do $PY -I $G import-session "$junk" "$IC" "$IO" 2>/dev/null; done
+[[ "$(ls -lRT "$IC" | md5)" == "$before" ]] && ok "импорт: облачная история не меняется" || bad "импорт: облачная история изменена"
+[[ $(find "$IO" -name '*.jsonl' | wc -l | tr -d ' ') == 1 ]] && ok "импорт: пути и мусор вместо номера игнорируются" || bad "импорт: лишние файлы в локальной истории"
+SID2=21111111-2222-4333-8444-555555555555; SID3=31111111-2222-4333-8444-555555555555
+mkdir -p "$T/imp/elsewhere"; print -r -- '{"x":1}' > "$T/imp/elsewhere/$SID2.jsonl"
+ln -s "$T/imp/elsewhere" "$IC/-linked"; ln -s "$T/imp/elsewhere/$SID2.jsonl" "$IC/-proj/$SID3.jsonl"
+$PY -I $G import-session "$SID2" "$IC" "$IO" 2>/dev/null; $PY -I $G import-session "$SID3" "$IC" "$IO" 2>/dev/null
+[[ -z "$(find "$IO" -name "$SID2.jsonl" -o -name "$SID3.jsonl")" ]] && ok "импорт: ссылки из облачной истории не переносятся" || bad "импорт: перенесена ссылка"
+$PY -I $G import-session "$SID" "$IC" "$IC/sub" 2>/dev/null && bad "импорт: назначение внутри источника принято" || ok "импорт: назначение внутри источника отклонено"
+# launcher: offline imports, the Lab never does; the source override is a test hook for tests/ only
+SID4=41111111-2222-4333-8444-555555555555; FX="$REPO/tests/.import-fixture-$$"; FP="-claude-local-import-selftest"
+mkdir -p "$FX/$FP"; print -r -- '{"type":"user","message":{"role":"user","content":"selftest"}}' > "$FX/$FP/$SID4.jsonl"
+/bin/rm -rf "${HOME:?}/.claude-local/projects/$FP" "${HOME:?}/.claude-local-net/projects/$FP"
+(cd "$T/work" && CLAUDE_LOCAL_DRYRUN=1 CLAUDE_LOCAL_CLOUD_PROJECTS="$FX" "$REPO/bin/claude-local" --web -p hi --resume "$SID4" >/dev/null 2>&1 </dev/null)
+[[ ! -e "$HOME/.claude-local-net/projects/$FP" && ! -e "$HOME/.claude-local/projects/$FP" ]] && ok "лаунчер: Лаборатория облачную сессию не переносит" || bad "лаунчер: Лаборатория перенесла облачную сессию"
+(cd "$T/work" && CLAUDE_LOCAL_DRYRUN=1 CLAUDE_LOCAL_CLOUD_PROJECTS="$FX" "$REPO/bin/claude-local" -p hi --resume "$SID4" >/dev/null 2>&1 </dev/null)
+[[ -f "$HOME/.claude-local/projects/$FP/$SID4.jsonl" ]] && ok "лаунчер: офлайн переносит облачную сессию по --resume" || bad "лаунчер: офлайн не перенёс облачную сессию"
+r=$(cd "$T/work" && CLAUDE_LOCAL_DRYRUN=1 CLAUDE_LOCAL_CLOUD_PROJECTS="$T/imp/cloud" "$REPO/bin/claude-local" -p hi --resume "$SID" 2>&1 </dev/null)
+[[ $? -ne 0 && "$r" == *"только для тестов"* ]] && ok "лаунчер: CLAUDE_LOCAL_CLOUD_PROJECTS вне tests/ отклонён" || bad "лаунчер: CLAUDE_LOCAL_CLOUD_PROJECTS вне tests/ принят"
+# adversarial review 20.11: links/case/hardlinks/newline/clusters must not move data anywhere else
+SID5=51111111-2222-4333-8444-555555555555; mkdir -p "$IC/-p5" "$T/imp/victim"; print -r -- '{"v":5}' > "$IC/-p5/$SID5.jsonl"
+mkdir -p "$T/imp/o2"; ln -s "$T/imp/victim" "$T/imp/o2/projects"
+$PY -I $G import-session "$SID5" "$IC" "$T/imp/o2/projects" 2>/dev/null
+[[ -z "$(ls -A "$T/imp/victim")" ]] && ok "импорт: локальная история-ссылка не принимается (ничего не записано по ссылке)" || bad "импорт: записал по ссылке вместо локальной истории"
+$PY -I $G import-session "$SID5" "$IC" "${IC:h}/CLOUD/stolen" 2>/dev/null
+[[ ! -e "$IC/stolen" ]] && ok "импорт: назначение в облачной истории другим регистром отклонено" || bad "импорт: записал в облачную историю через другой регистр"
+mkdir -p "$T/imp/o3/projects"; ln -s "$T/imp/victim" "$T/imp/o3/projects/-p5"
+$PY -I $G import-session "$SID5" "$IC" "$T/imp/o3/projects" 2>/dev/null
+[[ -z "$(ls -A "$T/imp/victim")" ]] && ok "импорт: подложенная ссылка на папку проекта не используется" || bad "импорт: записал через подложенную ссылку проекта"
+SID6=61111111-2222-4333-8444-555555555555; mkdir -p "$IC/-p6"; print -r -- '{"secret":1}' > "$T/imp/elsewhere/secret.txt"
+ln "$T/imp/elsewhere/secret.txt" "$IC/-p6/$SID6.jsonl"
+$PY -I $G import-session "$SID6" "$IC" "$IO" 2>/dev/null
+[[ ! -e "$IO/-p6/$SID6.jsonl" ]] && ok "импорт: жёсткая ссылка не переносится" || bad "импорт: перенесена жёсткая ссылка"
+$PY -I $G import-session "$SID5"$'\n' "$IC" "$T/imp/o4" 2>/dev/null
+[[ ! -e "$T/imp/o4" ]] && ok "импорт: номер с переводом строки игнорируется" || bad "импорт: принят номер с переводом строки"
+mkdir -p "$FX/real"; ln -s "$FX/real" "$REPO/tests/.import-link-$$"; mkdir -p "$T/imp/outside/-x"
+r=$(cd "$T/work" && CLAUDE_LOCAL_DRYRUN=1 CLAUDE_LOCAL_CLOUD_PROJECTS="$REPO/tests/.import-link-$$/../../../$(basename "$T")/imp/outside" "$REPO/bin/claude-local" -p hi --resume "$SID" 2>&1 </dev/null)
+[[ $? -ne 0 && "$r" == *"только для тестов"* ]] && ok "лаунчер: обход tests/<ссылка>/.. отклонён" || bad "лаунчер: CLAUDE_LOCAL_CLOUD_PROJECTS обошёл проверку"
+/bin/rm -f "$REPO/tests/.import-link-$$"
+for form in "-pr$HOME/.claude-local/projects/x/$SID.jsonl" "-pr"; do
+  extra=(); [[ $form == -pr ]] && extra=("$HOME/.claude-local/projects/x/$SID.jsonl")
+  r=$(cd "$T/work" && CLAUDE_LOCAL_DRYRUN=1 "$REPO/bin/claude-local" --web "$form" "${extra[@]}" hi 2>&1 </dev/null)
+  [[ $? -ne 0 && "$r" == *"по пути к файлу"* ]] && ok "Лаборатория: ${form:0:3}… по пути к офлайн-истории отклонён" || bad "Лаборатория: ${form:0:3}… по пути прошёл"
+done
+/bin/rm -rf "${HOME:?}/.claude-local/projects/$FP" "${HOME:?}/.claude-local-net/projects/$FP" "$FX"
+
 /bin/rm -rf "$T"
 print "=== guard tests: $fail ❌"
 exit $fail

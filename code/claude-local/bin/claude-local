@@ -303,6 +303,21 @@ if (( preload )); then
   exit 0
 fi
 
+# Values given to --resume / -r in any spelling, incl. short-flag clusters (-pr <v>, -pr<v>; review 20.11.2026).
+resume_vals() {
+  rv=(); local i a rest
+  for (( i = 1; i <= ${#pass}; i++ )); do
+    a=${pass[i]}
+    case "$a" in
+      --resume|--session-id|--fork-session) (( i < ${#pass} )) && rv+=("${pass[i+1]}") ;;
+      --resume=*|--session-id=*)             rv+=("${a#*=}") ;;
+      --*)                                   ;;
+      -*r*)                                  rest=${a#-}; rest=${rest#*r}
+                                             if [[ -z $rest ]]; then (( i < ${#pass} )) && rv+=("${pass[i+1]}")
+                                             else rv+=("$rest"); fi ;;
+    esac
+  done
+}
 CONF=$CONF_OFFLINE; [[ $mode == net ]] && CONF=$CONF_NET
 WORKDIR="${PWD:A}"
 # Folders that hold many projects at once (client ones among them): never a work folder as a whole.
@@ -340,13 +355,8 @@ if [[ $mode == net ]]; then
   fi
   # never resume an offline transcript in an online session (offline history = client data):
   # session ids are plain UUIDs/names; a value with "/" or ".jsonl" is a file path → refuse.
-  for (( i = 1; i <= ${#pass}; i++ )); do
-    a=${pass[i]}; v=""
-    case "$a" in
-      -r|--resume|--session-id|--fork-session) (( i < ${#pass} )) && v=${pass[i+1]} ;;
-      --resume=*|--session-id=*)               v=${a#*=} ;;
-      -r?*)                                    v=${a#-r} ;;          # attached form: -r/path/x.jsonl
-    esac
+  resume_vals
+  for v in "${rv[@]}"; do
     if [[ "$v" == */* || "$v" == *.jsonl ]]; then
       die "в режиме с интернетом нельзя открывать сессию по пути к файлу ($v) — офлайн-история туда не переносится."
     fi
@@ -366,6 +376,23 @@ vlog() {
   if [[ $(wc -l < "$f" 2>/dev/null || print 0) -gt 2000 ]]; then tail -n 500 "$f" > "$f.tmp" && mv "$f.tmp" "$f"; fi
 }
 vlog start
+# Continue a cloud session locally (20.11.2026). VS Code lists the folder's regular (cloud) sessions in
+# «Локальный Claude»; --resume <id> of such a session found nothing in the offline history. Copy it ONE WAY,
+# cloud → offline history, offline mode only: the Lab never gets it (offline history = client data) and
+# nothing is ever written back to ~/.claude.
+if [[ $mode == offline && $kind == session ]]; then
+  CLOUD_PROJECTS="$HOME/.claude/projects"
+  if [[ -n "${CLAUDE_LOCAL_CLOUD_PROJECTS:-}" ]]; then        # test hook: fixtures under tests/ only
+    # :P = physical path (links and .. resolved) — :A dropped `tests/<link>/..` lexically (review 20.11)
+    [[ -d "$CLAUDE_LOCAL_CLOUD_PROJECTS" && "${CLAUDE_LOCAL_CLOUD_PROJECTS:P}/" == "${HARNESS_HOME:P}/tests/"?* ]] \
+      || die "CLAUDE_LOCAL_CLOUD_PROJECTS — только для тестов (папка внутри tests/)"
+    CLOUD_PROJECTS="${CLAUDE_LOCAL_CLOUD_PROJECTS:P}"
+  fi
+  resume_vals
+  for v in "${rv[@]}"; do
+    "${GUARD[@]}" import-session "$v" "$CLOUD_PROJECTS" "$CONF_OFFLINE/projects" && vlog "resume ${v:0:8}" || true
+  done
+fi
 mkdir -p "$CONF/tmp"
 leasefd=""
 if [[ $kind == session && "${CLAUDE_LOCAL_DRYRUN:-}" != 1 ]]; then

@@ -8,6 +8,9 @@
   guard.py sandbox-net OUT.sb HOME WORKDIR CONF REPO BIN LIST EXTRA_ALLOW_LIST SKILLS_LIST
   guard.py sync-skills CONF SKILLS_LIST         → CONF/skills = exactly the listed skills
   guard.py trust CONF WORKDIR                   → mark WORKDIR trusted in CONF/.claude.json
+  guard.py import-session SID CLOUD_PROJECTS OFFLINE_PROJECTS
+                                                → continue a regular (cloud) session in the offline mode:
+                                                  copy CLOUD/<project>/<SID>.jsonl → OFFLINE/<project>/ (one way)
 
 Paths are matched against what is actually on disk: APFS is case- and normalization-insensitive,
 so list entries are resolved component by component with NFC + casefold comparison (an entry typed
@@ -16,6 +19,8 @@ in NFC still finds a folder stored in NFD, "лиды" finds "Лиды"). Globs o
 import fnmatch
 import json
 import os
+import re
+import stat
 import sys
 import unicodedata
 
@@ -333,6 +338,160 @@ def build_net_sandbox(out, home, workdir, conf, repo, binfile, list_path, extra_
     atomic_write(out, profile)
 
 
+SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+IMPORT_MAX_BYTES = 512 * 1024 * 1024
+_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _open_dir(path):
+    """Open PATH as a directory with NO symlink in any component (walks from /): a session that replaced a
+    folder with a link (adversarial review 20.11: ~/.claude-local/projects → Lab history or ~/.claude) is
+    refused instead of followed. Returns an fd; raises OSError."""
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in [x for x in os.path.abspath(path).split(os.sep) if x]:
+            nfd = os.open(part, _DIR, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _sub_dir(parent_fd, name, create):
+    """Child directory of an open directory, never through a link; created 0700 if asked."""
+    try:
+        return os.open(name, _DIR, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        return os.open(name, _DIR, dir_fd=parent_fd)
+
+
+def import_session(sid, cloud_root, offline_projects):
+    """20.11.2026: «начал в облаке — продолжил локально». VS Code shows the folder's regular (cloud)
+    sessions in the history list of «Локальный Claude»; --resume <id> of one of them found nothing in the
+    offline history. Copy that transcript ONE WAY: CLOUD/<project>/<id>.jsonl → OFFLINE/<project>/.
+    Every path is opened component by component without following links, and every write goes relative to
+    an already open directory (no check-then-use race). Never writes under CLOUD; the launcher never calls
+    this for the Lab. Silent no-op when there is nothing to do. Returns 0, or 1 on refusal."""
+    if not isinstance(sid, str) or not SESSION_ID.fullmatch(sid):
+        return 0                                      # titles, paths, garbage: not ours to handle
+    name = sid + ".jsonl"
+    try:
+        cfd = _open_dir(cloud_root)
+    except OSError:
+        return 0                                      # no cloud history (or it is behind a link): nothing to do
+    fds = [cfd]
+    try:
+        try:
+            conf_fd = _open_dir(os.path.dirname(os.path.abspath(offline_projects)))
+        except OSError:
+            print("import-session: папка локальной истории недоступна или подменена ссылкой — отказ", file=sys.stderr)
+            return 1
+        fds.append(conf_fd)
+        # before creating anything: the destination must not lie inside the cloud history (APFS ignores case,
+        # so compare by inode via inside(), not by string — review 20.11)
+        if inside(os.path.dirname(os.path.abspath(offline_projects)), [cloud_root]):
+            print("import-session: назначение внутри облачной истории — отказ", file=sys.stderr)
+            return 1
+        try:
+            ofd = _sub_dir(conf_fd, os.path.basename(os.path.abspath(offline_projects)), create=True)
+        except OSError:
+            print("import-session: projects локальной истории подменена ссылкой — отказ", file=sys.stderr)
+            return 1
+        fds.append(ofd)
+        o, c = os.fstat(ofd), os.fstat(cfd)
+        if (o.st_dev, o.st_ino) == (c.st_dev, c.st_ino) or inside(offline_projects, [cloud_root]) \
+                or inside(cloud_root, [offline_projects]):
+            print("import-session: источник и назначение пересекаются — отказ", file=sys.stderr)
+            return 1
+        for proj in os.listdir(ofd):                  # already in the offline history: continue that copy
+            try:
+                pfd = os.open(proj, _DIR, dir_fd=ofd)
+            except OSError:
+                continue
+            try:
+                os.stat(name, dir_fd=pfd, follow_symlinks=False)
+                return 0
+            except OSError:
+                pass
+            finally:
+                os.close(pfd)
+        found = []
+        for proj in os.listdir(cfd):
+            if proj.startswith("."):
+                continue
+            try:
+                pfd = os.open(proj, _DIR, dir_fd=cfd)  # a linked project folder is skipped
+            except OSError:
+                continue
+            try:
+                st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
+            except OSError:
+                os.close(pfd)
+                continue
+            if stat.S_ISREG(st.st_mode):
+                found.append((proj, pfd))
+            else:
+                os.close(pfd)
+        fds += [f for _, f in found]
+        if len(found) != 1:
+            return 0                                  # none (normal «not found») or ambiguous
+        proj, pfd = found[0]
+        try:
+            sfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=pfd)
+        except OSError:
+            return 0
+        with os.fdopen(sfd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
+                return 0                              # FIFO swapped in, hard link to elsewhere, foreign file
+            if st.st_size > IMPORT_MAX_BYTES:
+                print(f"import-session: облачная сессия больше {IMPORT_MAX_BYTES >> 20} МБ — не переношу", file=sys.stderr)
+                return 0
+            data = f.read(IMPORT_MAX_BYTES + 1)
+        cut = data.rfind(b"\n")                       # a live session may be mid-write: drop a partial line
+        data = data[:cut + 1] if cut >= 0 else b""
+        if not data:
+            return 0
+        try:
+            dfd = _sub_dir(ofd, proj, create=True)
+        except OSError:
+            print("import-session: папка проекта в локальной истории подменена ссылкой — отказ", file=sys.stderr)
+            return 1
+        fds.append(dfd)
+        tmp = ".import-%d-%s" % (os.getpid(), os.urandom(6).hex())
+        tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+        try:
+            with os.fdopen(tfd, "wb") as t:
+                t.write(data)
+                t.flush()
+                os.fsync(t.fileno())
+            try:                                      # no-clobber: a concurrent launch may have won
+                os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+            except FileExistsError:
+                return 0
+        finally:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+        print(f"↪ облачная сессия {sid[:8]} перенесена в локальную историю: продолжаешь на локальной модели без "
+              "интернета. Облачная копия не меняется, локальное продолжение в облако не попадёт.", file=sys.stderr)
+        return 0
+    finally:
+        for f in fds:
+            try:
+                os.close(f)
+            except OSError:
+                pass
+
 if __name__ == "__main__":
     cmd, *a = sys.argv[1:]
     if cmd == "clients":
@@ -349,5 +508,7 @@ if __name__ == "__main__":
         sync_skills(*a)
     elif cmd == "trust":
         trust_folder(*a)
+    elif cmd == "import-session":
+        sys.exit(import_session(*a))
     else:
         sys.exit(f"unknown command {cmd}")
