@@ -232,6 +232,49 @@ codesign --verify --strict -R='anchor apple generic and certificate leaf[subject
 codesign --verify --strict -R='anchor apple generic and certificate leaf[subject.OU] = "Q6L2SF6YDW"' "$HOME/.claude-local/bin/claude" 2>/dev/null \
   && ok "закрепление: закреплённый Claude Code подписан Anthropic" || bad "закрепление: закреплённый бинарь не подписан Anthropic"
 
+# --- cross-session messaging (20.11.2026): the Lab bound an inbox in CONF/tmp/cc-socks and queued a message an
+# outside process wrote there → text (e.g. from a session with client files) could reach the internet-enabled Lab.
+# Policies refuse inbound peer messages; here the REAL pinned Claude Code runs in each sandbox (dead model URL —
+# no model needed), an outside process writes into its inbox, and the message must not get in.
+for m in net offline; do
+  $PY -I -c 'import json,sys; d=json.load(open(sys.argv[1])); deny=d["permissions"]["deny"]; sys.exit(0 if d.get("crossSessionInbound")=="refuse" and "SendMessage" in deny and "ListAgents" in deny else 1)' "$REPO/config/policy-$m.json" \
+    && ok "политика $m: входящие от других сессий отклоняются, SendMessage/ListAgents запрещены" || bad "политика $m: переписка сессий не закрыта"
+done
+peer_probe() {   # $1 mode (net|offline), $2 CONF dir, $3 work dir, rest: sandbox-exec prefix
+  local mode=$1 conf=$2 work=$3; shift 3
+  mkdir -p "$conf/tmp" "$conf/debug" "$work"; local log="$conf/debug/peer-probe.txt"; /bin/rm -f "$log"
+  $PY -I $G policy "$mode" "$REPO/config/policy-$mode.json" "$conf/.policy.json" "${CL:-$REPO/config/client-folders.list}" 2>/dev/null
+  local here=$PWD; cd "$work"
+  perl -e 'alarm 25; exec @ARGV' "$@" /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin USER="$USER" CLAUDE_CONFIG_DIR="$conf" \
+    TMPDIR="$conf/tmp" CLAUDE_CODE_TMPDIR="$conf/tmp" ANTHROPIC_BASE_URL=http://localhost:1235 ANTHROPIC_AUTH_TOKEN=x \
+    ANTHROPIC_MODEL=probe CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_FEATURE_FLAGS=1 DISABLE_AUTOUPDATER=1 \
+    "$HOME/.claude-local/bin/claude" -p hi --debug-file "$log" --settings "$conf/.policy.json" --setting-sources user >/dev/null 2>&1 &
+  local pid=$! sock="" i
+  cd "$here"
+  for i in {1..60}; do
+    sock=$(grep -ho 'Listening: [^ ]*\.sock' "$log" 2>/dev/null | head -1)
+    [[ -n $sock ]] && break
+    grep -q 'refusing to bind' "$log" 2>/dev/null && break
+    sleep 0.25
+  done
+  sock=${sock#Listening: }
+  if [[ -n $sock ]]; then
+    $PY -I -c 'import socket,sys;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"peer-probe\"}}\n");s.close()' "$sock" 2>/dev/null
+    sleep 2
+  fi
+  kill $pid 2>/dev/null; wait $pid 2>/dev/null
+  if grep -q 'Routed user message' "$log" 2>/dev/null; then bad "$mode: сообщение от внешнего процесса попало в сессию"
+  elif [[ -n $sock ]] && grep -q 'refused inbound peer message' "$log"; then ok "$mode: ящик сессии есть, входящее отклонено"
+  elif [[ -z $sock ]] && grep -q 'refusing to bind' "$log" 2>/dev/null; then ok "$mode: ящика нет — песочница не дала его создать"
+  else bad "$mode: проверка ящика без результата (${sock:-нет сокета})"; fi
+}
+if [[ -x "$HOME/.claude-local/bin/claude" ]]; then
+  peer_probe net "$T/conf" "$T/work" sandbox-exec -f "$T/net.sb"
+  peer_probe offline "$H/peerconf" "$H/peerwork" sandbox-exec -f "$REPO/config/offline.sb" -D WORKDIR="$H/peerwork" -D CONFDIR="$H/peerconf" -D REPO="$REPO" -D HOME="$HOME"
+else
+  bad "переписка сессий: нет закреплённого Claude Code ($HOME/.claude-local/bin/claude)"
+fi
+
 /bin/rm -rf "$T"
 print "=== guard tests: $fail ❌"
 exit $fail

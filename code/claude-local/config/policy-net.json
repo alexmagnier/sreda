@@ -52,5 +52,7 @@
     "command": "__HARNESS_HOME__/bin/statusline.sh"
   },
   "_comment_ide": "VS Code IDE tools run in the (unsandboxed) extension host: in the online mode they could open and read a client file past the kernel sandbox — denied.",
-  "_comment_tools": "Tools the local model does not need are denied: denied tools are not sent to the model, the prompt gets shorter and the first answer faster."
+  "_comment_tools": "Tools the local model does not need are denied: denied tools are not sent to the model, the prompt gets shorter and the first answer faster.",
+  "_comment_peers": "Переписка сессий Claude Code (ListAgents/SendMessage, сокет-ящик): отправка запрещена в deny, входящие отклоняются. 20.11.2026 Лаборатория открыла ящик в CONF/tmp/cc-socks и приняла сообщение от внешнего процесса: так в сессию с интернетом мог попасть текст из сессии с клиентскими файлами.",
+  "crossSessionInbound": "refuse"
 }
